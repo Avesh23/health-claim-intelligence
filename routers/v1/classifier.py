@@ -2,7 +2,10 @@ import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
-from models.classification import BatchClassificationResponse, FileClassificationResult
+from models.classification import (
+    BatchClassificationResponse, FileClassificationResult,
+    BatchExtractionResponse, FileExtractionResult, ExtractedData,
+)
 from services.gemini_classifier import GeminiClassifier
 
 logger = logging.getLogger(__name__)
@@ -93,3 +96,65 @@ async def classify_bill_document(
 
     results = await asyncio.gather(*[_classify_one(f) for f in files])
     return BatchClassificationResponse(results=list(results))
+
+
+# ── Data Extraction ─────────────────────────────────────────────────
+
+
+@router.post(
+    "/extract",
+    response_model=BatchExtractionResponse,
+    summary="Extract structured data from one or more documents",
+)
+async def extract_document_data(
+    files: list[UploadFile] = File(...),
+    classifier: GeminiClassifier = Depends(get_classifier),
+):
+    """
+    Upload one or more documents (PDF, image, or plain text).
+    Returns extracted fields (member_id, policy_number, line_items, etc.)
+    for each file.
+    """
+    async def _extract_one(file: UploadFile) -> FileExtractionResult:
+        content_type = file.content_type or "application/octet-stream"
+        mime_type = ALLOWED_MIME_TYPES.get(content_type)
+        if mime_type is None:
+            logger.warning(
+                "Unsupported file type | filename=%s mime=%s", file.filename, content_type
+            )
+            return FileExtractionResult(
+                filename=file.filename or "unknown",
+                data=ExtractedData(),
+            )
+
+        try:
+            content = await file.read()
+        except Exception as exc:
+            logger.exception("Failed to read file | filename=%s", file.filename)
+            return FileExtractionResult(
+                filename=file.filename or "unknown",
+                data=ExtractedData(),
+            )
+
+        logger.info(
+            "File received for extraction | filename=%s size=%d bytes mime_type=%s",
+            file.filename, len(content), mime_type,
+        )
+
+        try:
+            extracted = classifier.extract_document(content, mime_type=mime_type)
+        except RuntimeError as exc:
+            logger.error("Gemini extraction error | filename=%s error=%s", file.filename, exc)
+            return FileExtractionResult(
+                filename=file.filename or "unknown",
+                data=ExtractedData(),
+            )
+
+        logger.info("Extraction done | filename=%s", file.filename)
+        return FileExtractionResult(
+            filename=file.filename or "unknown",
+            data=extracted,
+        )
+
+    results = await asyncio.gather(*[_extract_one(f) for f in files])
+    return BatchExtractionResponse(results=list(results))
