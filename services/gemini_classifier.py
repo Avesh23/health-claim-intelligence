@@ -3,9 +3,9 @@ import json
 import logging
 import os
 import re
+from typing import Any
 
 import google.generativeai as genai
-from models.classification import ExtractedData, LineItem
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,39 @@ class GeminiClassifier:
         "cashless authorisation",
         "other",
     )
+    EXTRACTION_FIELDS_BY_CATEGORY = {
+        "id proof": (
+            "name",
+            "id_type",
+            "id_number",
+            "date_of_birth",
+            "phone_number",
+            "address",
+        ),
+        "invoice/bill": (
+            "bill_number",
+            "bill_date",
+            "customer_name",
+            "address",
+            "policy_number",
+            "billing_items",
+            "grand_total",
+        ),
+        "policy form": (
+            "policy_number",
+            "policy_issued_on",
+            "period_of_insurance",
+            "policy_status",
+            "expiry_date",
+            "customer_id",
+        ),
+        "discharge summary": (
+            "patient_name",
+            "date_of_admission",
+            "date_of_discharge",
+            "diagnosis",
+        ),
+    }
 
     def __init__(self, api_key: str | None = None):
         resolved_api_key = api_key or os.getenv("GEMINI_API_KEY")
@@ -118,6 +151,14 @@ class GeminiClassifier:
         }
         return aliases.get(raw, "other")
 
+    @classmethod
+    def normalise_extraction_category(cls, category: str) -> str:
+        return cls._normalise_category(category)
+
+    @classmethod
+    def get_supported_extraction_categories(cls) -> tuple[str, ...]:
+        return tuple(cls.EXTRACTION_FIELDS_BY_CATEGORY.keys())
+
     def classify_document(
         self, document_bytes: bytes, mime_type: str = "application/pdf"
     ) -> tuple[str, float | None]:
@@ -152,41 +193,66 @@ class GeminiClassifier:
         )
         return category, confidence
 
-    @staticmethod
-    def _build_extraction_prompt() -> str:
+    @classmethod
+    def _build_extraction_prompt(cls, document_category: str) -> str:
+        field_names = cls.EXTRACTION_FIELDS_BY_CATEGORY[document_category]
+        json_lines = cls._build_extraction_json_lines(document_category, field_names)
+        field_list = ", ".join(f'"{field_name}"' for field_name in field_names)
+
         return (
             "You are a document data-extraction assistant.\n"
-            "Extract the following fields from the document. If a field is not present, "
-            "set its value to null.\n\n"
+            f'The document category is "{document_category}".\n'
+            f"Extract ONLY these fields: {field_list}.\n"
+            "If a field is not present, set its value to null.\n"
             "Respond with ONLY valid JSON (no markdown fences, no extra text):\n"
             "{\n"
-            '  "member_id": "...",\n'
-            '  "policy_number": "...",\n'
-            '  "claim_date": "...",\n'
-            '  "treatment_date": "...",\n'
-            '  "claimed_amount": "...",\n'
-            '  "line_items": [\n'
-            '    {"description": "...", "amount": "...", "quantity": "..."}\n'
-            "  ],\n"
-            '  "signature": "present / absent / unclear",\n'
-            '  "location": "...",\n'
-            '  "bank_amount": "..."\n'
+            f"{json_lines}\n"
             "}\n\n"
             "Rules:\n"
-            '- Keep amounts as strings exactly as printed (e.g. "Rs 12,345.00").\n'
+            f'- Do not return any fields other than: {field_list}.\n'
             "- Dates should be in DD-MM-YYYY format if possible.\n"
-            "- line_items is a list; include every billable item you can find.\n"
-            "- For signature, state whether a signature is present, absent, or unclear."
+            "- Keep names, IDs, addresses, and totals as written in the document when possible.\n"
+            "- If a field is missing or unreadable, return null for that field.\n"
+            "- For invoice/bill documents, include every line item you can find in billing_items.\n"
+            "- If an invoice/bill line item contains multiple nested sub-items, return only the main parent billing item and ignore the sub-items.\n"
+            "- Preserve status and diagnosis wording as written in the document when possible."
         )
 
+    @staticmethod
+    def _build_extraction_json_lines(
+        document_category: str, field_names: tuple[str, ...]
+    ) -> str:
+        json_lines: list[str] = []
+        for field_name in field_names:
+            if document_category == "invoice/bill" and field_name == "billing_items":
+                json_lines.extend(
+                    [
+                        '  "billing_items": [',
+                        '    {"billing_item": "...", "quantity": "...", "rate": "...", "subtotal": "..."}',
+                        "  ]",
+                    ]
+                )
+                continue
+
+            json_lines.append(f'  "{field_name}": "..."')
+
+        return ",\n".join(json_lines)
+
     def extract_document(
-        self, document_bytes: bytes, mime_type: str = "application/pdf"
-    ) -> ExtractedData:
-        """Extract structured fields from a document using Gemini."""
-        prompt = self._build_extraction_prompt()
+        self,
+        document_bytes: bytes,
+        mime_type: str = "application/pdf",
+        document_category: str = "policy form",
+    ) -> dict[str, Any]:
+        """Extract category-specific fields from a document using Gemini."""
+        prompt = self._build_extraction_prompt(document_category)
+        allowed_fields = self.EXTRACTION_FIELDS_BY_CATEGORY[document_category]
         doc_size_kb = len(document_bytes) / 1024
         logger.info(
-            "Extracting data | mime_type=%s size=%.1f KB", mime_type, doc_size_kb
+            "Extracting data | category=%s mime_type=%s size=%.1f KB",
+            document_category,
+            mime_type,
+            doc_size_kb,
         )
 
         try:
@@ -218,31 +284,27 @@ class GeminiClassifier:
             logger.error("Failed to parse Gemini JSON: %s | raw=%r", exc, raw_text)
             raise RuntimeError(f"Gemini returned invalid JSON: {exc}") from exc
 
-        raw_items = parsed.get("line_items") or []
-        line_items = [
-            LineItem(
-                description=item.get("description"),
-                amount=item.get("amount"),
-                quantity=item.get("quantity"),
-            )
-            for item in raw_items
-            if isinstance(item, dict)
-        ]
-
-        result = ExtractedData(
-            member_id=parsed.get("member_id"),
-            policy_number=parsed.get("policy_number"),
-            claim_date=parsed.get("claim_date"),
-            treatment_date=parsed.get("treatment_date"),
-            claimed_amount=parsed.get("claimed_amount"),
-            line_items=line_items or None,
-            signature=parsed.get("signature"),
-            location=parsed.get("location"),
-            bank_amount=parsed.get("bank_amount"),
-        )
+        result = {field_name: parsed.get(field_name) for field_name in allowed_fields}
+        if document_category == "invoice/bill":
+            raw_items = result.get("billing_items")
+            if isinstance(raw_items, list):
+                result["billing_items"] = [
+                    {
+                        "billing_item": item.get("billing_item"),
+                        "quantity": item.get("quantity"),
+                        "rate": item.get("rate"),
+                        "subtotal": item.get("subtotal"),
+                    }
+                    for item in raw_items
+                    if isinstance(item, dict)
+                ]
+            else:
+                result["billing_items"] = None
 
         logger.info(
-            "Extraction complete | fields_found=%d/9",
-            sum(1 for value in result.model_dump().values() if value is not None),
+            "Extraction complete | category=%s fields_found=%d/%d",
+            document_category,
+            sum(1 for value in result.values() if value is not None),
+            len(allowed_fields),
         )
         return result

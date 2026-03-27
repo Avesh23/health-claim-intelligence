@@ -2,12 +2,11 @@ import asyncio
 import logging
 
 import fitz
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 
 from models.classification import (
     BatchClassificationResponse,
     BatchExtractionResponse,
-    ExtractedData,
     FileClassificationResult,
     FileExtractionResult,
     PageClassificationResult,
@@ -226,13 +225,23 @@ async def classify_bill_document(
 )
 async def extract_document_data(
     files: list[UploadFile] = File(...),
+    document_category: str = Form(...),
     classifier: GeminiClassifier = Depends(get_classifier),
 ):
     """
     Upload one or more documents (PDF, image, or plain text).
-    Returns extracted fields (member_id, policy_number, line_items, etc.)
-    for each file.
+    Returns only the extraction fields relevant to the requested document category.
     """
+    normalized_category = classifier.normalise_extraction_category(document_category)
+    supported_categories = classifier.get_supported_extraction_categories()
+    if normalized_category not in supported_categories:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Unsupported document_category. "
+                f"Supported values: {', '.join(supported_categories)}"
+            ),
+        )
 
     async def _extract_one(file: UploadFile) -> FileExtractionResult:
         filename = file.filename or "unknown"
@@ -244,7 +253,8 @@ async def extract_document_data(
             )
             return FileExtractionResult(
                 filename=filename,
-                data=ExtractedData(),
+                document_category=normalized_category,
+                error=f"Unsupported file type: {content_type}",
             )
 
         try:
@@ -253,30 +263,38 @@ async def extract_document_data(
             logger.exception("Failed to read file | filename=%s", filename)
             return FileExtractionResult(
                 filename=filename,
-                data=ExtractedData(),
+                document_category=normalized_category,
+                error="Read error",
             )
 
         logger.info(
-            "File received for extraction | filename=%s size=%d bytes mime_type=%s",
+            "File received for extraction | filename=%s category=%s size=%d bytes mime_type=%s",
             filename,
+            normalized_category,
             len(content),
             mime_type,
         )
 
         try:
             extracted = await asyncio.to_thread(
-                classifier.extract_document, content, mime_type
+                classifier.extract_document, content, mime_type, normalized_category
             )
         except RuntimeError as exc:
             logger.error("Gemini extraction error | filename=%s error=%s", filename, exc)
             return FileExtractionResult(
                 filename=filename,
-                data=ExtractedData(),
+                document_category=normalized_category,
+                error=f"Gemini error: {exc}",
             )
 
-        logger.info("Extraction done | filename=%s", filename)
+        logger.info(
+            "Extraction done | filename=%s category=%s",
+            filename,
+            normalized_category,
+        )
         return FileExtractionResult(
             filename=filename,
+            document_category=normalized_category,
             data=extracted,
         )
 
