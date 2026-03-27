@@ -11,6 +11,18 @@ logger = logging.getLogger(__name__)
 
 
 class GeminiClassifier:
+    CLASSIFICATION_LABELS = (
+        "claim form",
+        "discharge summary",
+        "empty",
+        "id proof",
+        "invoice/bill",
+        "proposal form",
+        "policy form",
+        "cashless authorisation",
+        "other",
+    )
+
     def __init__(self, api_key: str | None = None):
         resolved_api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not resolved_api_key:
@@ -19,31 +31,92 @@ class GeminiClassifier:
         self.model = genai.GenerativeModel("gemini-2.5-flash")
         logger.debug("GeminiClassifier initialised with model=gemini-2.5-flash")
 
-    # ── Classification ──────────────────────────────────────────────
-
     @staticmethod
     def _build_prompt() -> str:
+        labels = "\n".join(f'- "{label}"' for label in GeminiClassifier.CLASSIFICATION_LABELS)
+        label_options = " | ".join(GeminiClassifier.CLASSIFICATION_LABELS)
         return (
-            "You are a document classification assistant.\n"
-            "Analyse the document and respond with EXACTLY two lines and nothing else:\n"
-            "Line 1: A short, descriptive category name for this document "
-            "(e.g. 'Invoice', 'Medical Report', 'Insurance Policy'). "
-            "Be concise — 1 to 4 words.\n"
-            "Line 2: Your confidence score as a decimal between 0.0 and 1.0 (e.g. 0.92)."
+            "You are a health-insurance document page classification assistant.\n"
+            "Analyse exactly one document page and classify it into exactly one of these labels:\n"
+            f"{labels}\n\n"
+            "If the page is blank or visually empty, return \"empty\".\n"
+            "If the page contains mixed content, choose the dominant document type.\n"
+            "Respond with ONLY valid JSON and no markdown fences:\n"
+            "{\n"
+            f'  "category": "{label_options}",\n'
+            '  "confidence": 0.0\n'
+            "}\n"
+            "Confidence must be a decimal between 0.0 and 1.0."
         )
 
     @staticmethod
     def _parse_response(text: str) -> tuple[str, float | None]:
-        """Return (category, confidence) from Gemini's two-line response."""
-        lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-        category = lines[0] if lines else "Uncategorized"
+        """Return (category, confidence) from Gemini's classification response."""
+        raw_text = text.strip()
+        if raw_text.startswith("```"):
+            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+            raw_text = re.sub(r"\s*```$", "", raw_text)
+
+        category = "other"
         confidence: float | None = None
-        if len(lines) >= 2:
-            match = re.search(r"(\d+(?:\.\d+)?)", lines[1])
+
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            logger.warning("Falling back to regex classification parse | raw=%r", raw_text)
+            lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+            if lines:
+                category = lines[0].strip('"').lower()
+            if len(lines) >= 2:
+                match = re.search(r"(\d+(?:\.\d+)?)", lines[1])
+                if match:
+                    raw = float(match.group(1))
+                    confidence = raw / 100.0 if raw > 1.0 else raw
+            return GeminiClassifier._normalise_category(category), confidence
+
+        parsed_category = parsed.get("category")
+        if isinstance(parsed_category, str) and parsed_category.strip():
+            category = parsed_category.strip().lower()
+
+        raw_confidence = parsed.get("confidence")
+        if isinstance(raw_confidence, (int, float)):
+            confidence = float(raw_confidence)
+        elif isinstance(raw_confidence, str):
+            match = re.search(r"(\d+(?:\.\d+)?)", raw_confidence)
             if match:
                 raw = float(match.group(1))
                 confidence = raw / 100.0 if raw > 1.0 else raw
-        return category, confidence
+
+        if confidence is not None:
+            confidence = max(0.0, min(confidence, 1.0))
+
+        return GeminiClassifier._normalise_category(category), confidence
+
+    @staticmethod
+    def _normalise_category(category: str) -> str:
+        raw = (category or "").strip().lower()
+        if raw in GeminiClassifier.CLASSIFICATION_LABELS:
+            return raw
+
+        aliases = {
+            "claim": "claim form",
+            "claimform": "claim form",
+            "claim_form": "claim form",
+            "discharge": "discharge summary",
+            "discharge_summary": "discharge summary",
+            "blank": "empty",
+            "id": "id proof",
+            "id_proof": "id proof",
+            "invoice": "invoice/bill",
+            "bill": "invoice/bill",
+            "invoice bill": "invoice/bill",
+            "invoice_bill": "invoice/bill",
+            "proposal": "proposal form",
+            "proposal_form": "proposal form",
+            "policy": "policy form",
+            "policy_form": "policy form",
+        }
+        return aliases.get(raw, "other")
 
     def classify_document(
         self, document_bytes: bytes, mime_type: str = "application/pdf"
@@ -60,21 +133,24 @@ class GeminiClassifier:
                 response = self.model.generate_content([prompt, text_content])
             else:
                 encoded = base64.standard_b64encode(document_bytes).decode("utf-8")
-                response = self.model.generate_content([
-                    {"inline_data": {"mime_type": mime_type, "data": encoded}},
-                    prompt,
-                ])
+                response = self.model.generate_content(
+                    [
+                        {"inline_data": {"mime_type": mime_type, "data": encoded}},
+                        prompt,
+                    ]
+                )
         except Exception as exc:
             logger.exception("Gemini classify call failed | mime_type=%s", mime_type)
             raise RuntimeError(f"Gemini API error: {exc}") from exc
 
         raw_text = (getattr(response, "text", "") or "").strip()
         category, confidence = self._parse_response(raw_text)
-        logger.info("Classification result | category=%r confidence=%s", category,
-                     f"{confidence:.2f}" if confidence is not None else "n/a")
+        logger.info(
+            "Classification result | category=%r confidence=%s",
+            category,
+            f"{confidence:.2f}" if confidence is not None else "n/a",
+        )
         return category, confidence
-
-    # ── Data Extraction ─────────────────────────────────────────────
 
     @staticmethod
     def _build_extraction_prompt() -> str:
@@ -97,7 +173,7 @@ class GeminiClassifier:
             '  "bank_amount": "..."\n'
             "}\n\n"
             "Rules:\n"
-            "- Keep amounts as strings exactly as printed (e.g. \"₹12,345.00\").\n"
+            '- Keep amounts as strings exactly as printed (e.g. "Rs 12,345.00").\n'
             "- Dates should be in DD-MM-YYYY format if possible.\n"
             "- line_items is a list; include every billable item you can find.\n"
             "- For signature, state whether a signature is present, absent, or unclear."
@@ -119,10 +195,12 @@ class GeminiClassifier:
                 response = self.model.generate_content([prompt, text_content])
             else:
                 encoded = base64.standard_b64encode(document_bytes).decode("utf-8")
-                response = self.model.generate_content([
-                    {"inline_data": {"mime_type": mime_type, "data": encoded}},
-                    prompt,
-                ])
+                response = self.model.generate_content(
+                    [
+                        {"inline_data": {"mime_type": mime_type, "data": encoded}},
+                        prompt,
+                    ]
+                )
         except Exception as exc:
             logger.exception("Gemini extract call failed | mime_type=%s", mime_type)
             raise RuntimeError(f"Gemini API error: {exc}") from exc
@@ -130,7 +208,6 @@ class GeminiClassifier:
         raw_text = (getattr(response, "text", "") or "").strip()
         logger.debug("Raw extraction response: %r", raw_text)
 
-        # Strip markdown code fences if Gemini adds them
         if raw_text.startswith("```"):
             raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
             raw_text = re.sub(r"\s*```$", "", raw_text)
@@ -141,7 +218,6 @@ class GeminiClassifier:
             logger.error("Failed to parse Gemini JSON: %s | raw=%r", exc, raw_text)
             raise RuntimeError(f"Gemini returned invalid JSON: {exc}") from exc
 
-        # Build LineItem objects
         raw_items = parsed.get("line_items") or []
         line_items = [
             LineItem(
@@ -165,7 +241,8 @@ class GeminiClassifier:
             bank_amount=parsed.get("bank_amount"),
         )
 
-        logger.info("Extraction complete | fields_found=%d/9",
-                     sum(1 for v in result.model_dump().values() if v is not None))
+        logger.info(
+            "Extraction complete | fields_found=%d/9",
+            sum(1 for value in result.model_dump().values() if value is not None),
+        )
         return result
-

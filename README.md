@@ -1,11 +1,12 @@
 # Bill Document Classification & Data Extraction API
 
-A robust FastAPI-based service that leverages Google Gemini (1.5 Flash) to classify documents and extract structured data from medical bills, insurance letters, and more.
+A robust FastAPI-based service that leverages Google Gemini to classify documents and extract structured data from medical bills, insurance letters, and more.
 
 ## 🚀 Features
 
 - **Multi-File Processing**: Upload multiple documents and images simultaneously.
-- **Auto-Classification**: Gemini freely determines the document category (e.g., "Invoice", "Discharge Summary").
+- **Page-Wise Classification**: PDFs are rendered page by page as images so mixed-document files can return different labels per page.
+- **Fixed Labels for Claims Workflows**: Classification is constrained to `claim form`, `discharge summary`, `id proof`, `invoice/bill`, `proposal form`, `policy form`, or `other`.
 - **Structured Data Extraction**: Automatically extracts 9 key fields:
   - Member ID, Policy Number, Claim/Treatment Dates, Claimed Amount, Location, Bank Amount, Signature Status, and detailed Line Items.
 - **Async Execution**: Processes batch uploads concurrently for high performance.
@@ -60,6 +61,7 @@ The API will be available at `http://localhost:8000`.
 ### 1. Classify Documents
 `POST /v1/classify`
 - **Description**: Identifies the category and confidence for one or more files.
+- **Behavior**: PDFs are rendered into page images and classified page by page. Images and text files return a single page result.
 - **Input**: Form-data with one or more `files`.
 - **Supported Formats**: PDF, PNG, JPEG, WebP, HEIC, TXT.
 
@@ -69,8 +71,27 @@ The API will be available at `http://localhost:8000`.
   "results": [
     {
       "filename": "bill.pdf",
-      "category": "Medical Invoice",
-      "confidence": 0.98
+      "pages": [
+        {
+          "page_number": 1,
+          "category": "claim form",
+          "confidence": 0.97,
+          "error": null
+        },
+        {
+          "page_number": 2,
+          "category": "id proof",
+          "confidence": 0.94,
+          "error": null
+        },
+        {
+          "page_number": 3,
+          "category": "invoice/bill",
+          "confidence": 0.99,
+          "error": null
+        }
+      ],
+      "error": null
     }
   ]
 }

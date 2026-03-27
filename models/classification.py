@@ -1,11 +1,18 @@
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class PageClassificationResult(BaseModel):
+    page_number: int
+    category: str
+    confidence: Optional[float] = None
+    error: Optional[str] = None
 
 
 class FileClassificationResult(BaseModel):
     filename: str
-    category: str
-    confidence: Optional[float] = None
+    pages: list[PageClassificationResult] = Field(default_factory=list)
+    error: Optional[str] = None
 
 
 class BatchClassificationResponse(BaseModel):
