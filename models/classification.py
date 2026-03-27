@@ -19,10 +19,17 @@ class BatchClassificationResponse(BaseModel):
     results: list[FileClassificationResult]
 
 
+class PageExtractionResult(BaseModel):
+    page_number: int
+    document_category: str
+    confidence: Optional[float] = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
 class FileExtractionResult(BaseModel):
     filename: str
-    document_category: str
-    data: dict[str, Any] = Field(default_factory=dict)
+    pages: list[PageExtractionResult] = Field(default_factory=list)
     error: Optional[str] = None
 
 

@@ -23,6 +23,15 @@ class GeminiClassifier:
         "other",
     )
     EXTRACTION_FIELDS_BY_CATEGORY = {
+        "cashless authorisation": (
+            "claim_reference_number",
+            "policy_name",
+            "patient_name",
+            "policy_number",
+            "policy_period",
+            "date_and_time",
+            "final_approved_amount",
+        ),
         "id proof": (
             "name",
             "id_type",
@@ -39,6 +48,13 @@ class GeminiClassifier:
             "policy_number",
             "billing_items",
             "grand_total",
+        ),
+        "proposal form": (
+            "name",
+            "gender",
+            "address",
+            "phone_number",
+            "period_of_insurance",
         ),
         "policy form": (
             "policy_number",
@@ -158,6 +174,10 @@ class GeminiClassifier:
     @classmethod
     def get_supported_extraction_categories(cls) -> tuple[str, ...]:
         return tuple(cls.EXTRACTION_FIELDS_BY_CATEGORY.keys())
+
+    @classmethod
+    def supports_extraction_category(cls, category: str) -> bool:
+        return category in cls.EXTRACTION_FIELDS_BY_CATEGORY
 
     def classify_document(
         self, document_bytes: bytes, mime_type: str = "application/pdf"
