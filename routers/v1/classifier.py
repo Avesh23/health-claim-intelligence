@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 import fitz
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 
 from models.classification import (
     BatchClassificationResponse,
@@ -25,6 +25,14 @@ ALLOWED_MIME_TYPES = {
     "image/webp": "image/webp",
     "image/heic": "image/heic",
 }
+
+
+def _expand_document_categories(raw_categories: list[str]) -> list[str]:
+    expanded_categories: list[str] = []
+    for raw_category in raw_categories:
+        parts = [part.strip() for part in raw_category.split(",")]
+        expanded_categories.extend(part for part in parts if part)
+    return expanded_categories
 
 
 def _is_visually_empty_pixmap(pixmap: fitz.Pixmap, threshold: int = 250) -> bool:
@@ -224,26 +232,58 @@ async def classify_bill_document(
     summary="Extract structured data from one or more documents",
 )
 async def extract_document_data(
+    request: Request,
     files: list[UploadFile] = File(...),
-    document_category: str = Form(...),
+    document_category: str | None = Form(None),
     classifier: GeminiClassifier = Depends(get_classifier),
 ):
     """
     Upload one or more documents (PDF, image, or plain text).
-    Returns only the extraction fields relevant to the requested document category.
+    Returns only the extraction fields relevant to the requested document category
+    for each file.
     """
-    normalized_category = classifier.normalise_extraction_category(document_category)
     supported_categories = classifier.get_supported_extraction_categories()
-    if normalized_category not in supported_categories:
+
+    form = await request.form()
+    raw_categories = [value for value in form.getlist("document_categories") if isinstance(value, str)]
+    if not raw_categories and document_category:
+        raw_categories = [document_category]
+    raw_categories = _expand_document_categories(raw_categories)
+
+    if not raw_categories:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide document_categories or document_category.",
+        )
+
+    if len(raw_categories) == 1 and len(files) > 1:
+        raw_categories = raw_categories * len(files)
+
+    if len(raw_categories) != len(files):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "Unsupported document_category. "
-                f"Supported values: {', '.join(supported_categories)}"
+                "The number of document categories must match the number of files. "
+                f"Received {len(raw_categories)} categories for {len(files)} files."
             ),
         )
 
-    async def _extract_one(file: UploadFile) -> FileExtractionResult:
+    normalized_categories: list[str] = []
+    for raw_category in raw_categories:
+        normalized_category = classifier.normalise_extraction_category(raw_category)
+        if normalized_category not in supported_categories:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Unsupported document_category: {raw_category}. "
+                    f"Supported values: {', '.join(supported_categories)}"
+                ),
+            )
+        normalized_categories.append(normalized_category)
+
+    async def _extract_one(
+        file: UploadFile, normalized_category: str
+    ) -> FileExtractionResult:
         filename = file.filename or "unknown"
         content_type = file.content_type or "application/octet-stream"
         mime_type = ALLOWED_MIME_TYPES.get(content_type)
@@ -298,5 +338,10 @@ async def extract_document_data(
             data=extracted,
         )
 
-    results = await asyncio.gather(*[_extract_one(file) for file in files])
+    results = await asyncio.gather(
+        *[
+            _extract_one(file, normalized_category)
+            for file, normalized_category in zip(files, normalized_categories)
+        ]
+    )
     return BatchExtractionResponse(results=list(results))
