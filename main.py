@@ -4,8 +4,12 @@ import uvicorn
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
 from core.exception_handlers import register_exception_handlers
 from core.logging_config import configure_logging
+from core.rate_limit import limiter
 from routers.v1 import classifier as v1_classifier_router
 
 logger = logging.getLogger(__name__)
@@ -22,6 +26,10 @@ def create_app() -> FastAPI:
         description="API for classifying various bill documents using Google Gemini.",
         version="1.0.0",
     )
+
+    # Rate limiting middleware and exception handler
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     register_exception_handlers(app)
     app.include_router(v1_classifier_router.router, prefix="/v1", tags=["v1"])

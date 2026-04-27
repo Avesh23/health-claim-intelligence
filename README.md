@@ -1,32 +1,47 @@
-# Bill Document Classification & Data Extraction API
+# 🏥 Health-Claim Document Intelligence
 
-A robust FastAPI-based service that leverages Google Gemini to classify documents and extract structured data from medical bills, insurance letters, and more.
+An enterprise-grade document processing suite that leverages **Google Gemini 2.0 Flash** to classify medical documents and extract structured data with high precision.
 
-## 🚀 Features
+[![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=Streamlit&logoColor=white)](https://streamlit.io/)
+[![Google Gemini](https://img.shields.io/badge/Google%20Gemini-8E75B2?style=for-the-badge&logo=googlegemini&logoColor=white)](https://ai.google.dev/)
 
-- **Multi-File Processing**: Upload multiple documents and images simultaneously.
-- **Page-Wise Classification**: PDFs are rendered page by page as images so mixed-document files can return different labels per page.
-- **Fixed Labels for Claims Workflows**: Classification is constrained to `claim form`, `discharge summary`, `id proof`, `invoice/bill`, `proposal form`, `policy form`, or `other`.
-- **Structured Data Extraction**: Automatically extracts 9 key fields:
-  - Member ID, Policy Number, Claim/Treatment Dates, Claimed Amount, Location, Bank Amount, Signature Status, and detailed Line Items.
-- **Async Execution**: Processes batch uploads concurrently for high performance.
-- **Robust Logging**: Comprehensive logging for requests, API calls, and errors.
+## ✨ Key Features
+
+- **Multi-Page Intelligent Processing**: Unlike basic OCR, this system analyzes multi-page PDFs as a single semantic unit.
+- **AI-Powered Classification**: Automatically categorizes documents into 9 specific insurance types (Claim Forms, Discharge Summaries, ID Proofs, etc.).
+- **Smart Data Extraction**:
+  - Extracts 15+ field types including Member IDs, Policy Numbers, and Dates.
+  - Handles complex **Line Items** and **Billing Tables** across multiple pages.
+  - Provides **Confidence Scores** for every extracted field.
+- **Built-in UI**: Includes a modern Streamlit dashboard for easy file uploads and visual results.
+- **Robust API**: Built with FastAPI, featuring rate limiting, structured logging, and async processing.
 
 ---
 
-## 🛠️ Setup
+## 🛠️ Technology Stack
+
+- **Backend**: FastAPI (Python 3.9+)
+- **Frontend**: Streamlit
+- **AI Engine**: Google Gemini 2.0 Flash (Multimodal)
+- **PDF Engine**: PyMuPDF (Fitz)
+- **Environment**: Docker Ready
+
+---
+
+## 🚀 Getting Started
 
 ### 1. Prerequisites
-- Python 3.9+
-- A Google Gemini API Key (get one from [Google AI Studio](https://aistudio.google.com/))
+- Python 3.9 or higher
+- A Google Gemini API Key. [Get one here](https://aistudio.google.com/).
 
 ### 2. Installation
 ```bash
 # Clone the repository
-git clone https://github.com/kaivalya-2004/health-claim.git
+git clone https://github.com/yourusername/health-claim.git
 cd health-claim
 
-# Create and activate virtual environment
+# Set up virtual environment
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
@@ -34,105 +49,64 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Environment Configuration
+### 3. Configuration
 Create a `.env` file in the root directory:
 ```env
-GEMINI_API_KEY=your_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 LOG_LEVEL=INFO
 ```
 
----
+### 4. Running the Application
 
-## 🏃 Running the API
-
-Start the development server:
+**Step 1: Start the Backend API**
 ```bash
 python main.py
 ```
-The API will be available at `http://localhost:8000`.
+The API will be live at `http://localhost:8000`. Explore the docs at `/docs`.
 
-- **Interative Docs (Swagger)**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **Redoc**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
+**Step 2: Start the Frontend UI**
+```bash
+streamlit run streamlit_app.py
+```
+Visit `http://localhost:8501` in your browser.
 
 ---
 
-## 📡 Endpoints
+## 📡 API Endpoints
 
-### 1. Classify Documents
+### 🔍 Document Classification
 `POST /v1/classify`
-- **Description**: Identifies the category and confidence for one or more files.
-- **Behavior**: PDFs are rendered into page images and classified page by page. Images and text files return a single page result.
-- **Input**: Form-data with one or more `files`.
-- **Supported Formats**: PDF, PNG, JPEG, WebP, HEIC, TXT.
+Upload documents to identify their type.
 
-**Response Example:**
-```json
-{
-  "results": [
-    {
-      "filename": "bill.pdf",
-      "pages": [
-        {
-          "page_number": 1,
-          "category": "claim form",
-          "confidence": 0.97,
-          "error": null
-        },
-        {
-          "page_number": 2,
-          "category": "id proof",
-          "confidence": 0.94,
-          "error": null
-        },
-        {
-          "page_number": 3,
-          "category": "invoice/bill",
-          "confidence": 0.99,
-          "error": null
-        }
-      ],
-      "error": null
-    }
-  ]
-}
+**Request:**
+```bash
+curl -X 'POST' \
+  'http://localhost:8000/v1/classify' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: multipart/form-data' \
+  -F 'files=@my_bill.pdf'
 ```
 
-### 2. Extract Data
+### 📑 Data Extraction
 `POST /v1/extract`
-- **Description**: Extracts structured JSON data from one or more files.
-- **Input**: Form-data with one or more `files`.
-
-**Response Example:**
-```json
-{
-  "results": [
-    {
-      "filename": "HC-1.pdf",
-      "data": {
-        "member_id": "MEM123",
-        "policy_number": "POL-789",
-        "claim_date": "15-03-2025",
-        "treatment_date": "10-03-2025",
-        "claimed_amount": "₹45,000",
-        "line_items": [
-          {"description": "Consultation", "amount": "₹2,000", "quantity": "1"}
-        ],
-        "signature": "present",
-        "location": "Mumbai",
-        "bank_amount": "₹45,000"
-      }
-    }
-  ]
-}
-```
+Extract structured JSON from recognized document types.
 
 ---
 
-## 📂 Project Structure
+## 📂 Supported Document Types
 
-- `main.py`: Application entry point and middleware configuration.
-- `core/`: Logging and exception handler configurations.
-- `models/`: Pydantic models for request/response validation.
-- `routers/`: API route definitions (v1).
-- `services/`: Core logic and integration with Google Generative AI.
-- `requirements.txt`: Project dependencies.
+| Category | Key Fields Extracted |
+| :--- | :--- |
+| **Claim Form** | Member ID, Policy Num, Claimed Amount, Signature Status |
+| **Discharge Summary** | Admission Date, Discharge Date, Diagnosis |
+| **Invoice/Bill** | Bill Date, Grand Total, Detailed Line Items |
+| **ID Proof** | Name, ID Number, Type, Date of Birth |
+| **Policy Form** | Customer ID, Expiry Date, Policy Status |
+
+---
+
+## 🛡️ License
+Distributed under the MIT License. See `LICENSE` for more information.
+
+---
+*Created with ❤️ for more efficient insurance workflows.*

@@ -1,11 +1,11 @@
-import base64
 import json
 import logging
 import os
 import re
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,19 @@ class GeminiClassifier:
         "cashless authorisation",
         "other",
     )
+    
+    LABEL_DESCRIPTIONS = {
+        "claim form": "A formal request to an insurance company for payment, usually contains sections for member details, treatment details, and a signature area.",
+        "discharge summary": "A clinical report prepared by a physician or other health professional at the conclusion of a hospital stay, detailing the admission, diagnosis, and treatment.",
+        "empty": "A blank page or a page with no meaningful text/graphics.",
+        "id proof": "Identification documents like Passport, Aadhaar, PAN card, or Driver's license.",
+        "invoice/bill": "A detailed list of goods or services provided, with individual costs and a total amount due.",
+        "proposal form": "An application for insurance coverage, filled out by the prospective policyholder.",
+        "policy form": "A document detailing the terms and conditions of the insurance policy, often includes the policy schedule.",
+        "cashless authorisation": "A letter or document from the insurance company or TPA authorizing the hospital to provide treatment without upfront payment by the patient.",
+        "other": "Any other document that does not fit the above categories."
+    }
+
     EXTRACTION_FIELDS_BY_CATEGORY = {
         "cashless authorisation": (
             "claim_reference_number",
@@ -70,32 +83,48 @@ class GeminiClassifier:
             "date_of_discharge",
             "diagnosis",
         ),
+        "claim form": (
+            "member_id",
+            "policy_number",
+            "claim_date",
+            "treatment_date",
+            "claimed_amount",
+            "location",
+            "bank_amount",
+            "signature_status",
+            "line_items",
+        ),
     }
 
     def __init__(self, api_key: str | None = None):
         resolved_api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not resolved_api_key:
             raise ValueError("GEMINI_API_KEY not found in environment variables.")
-        genai.configure(api_key=resolved_api_key)
-        self.model = genai.GenerativeModel("gemini-2.5-flash")
-        logger.debug("GeminiClassifier initialised with model=gemini-2.5-flash")
+        
+        self.client = genai.Client(api_key=resolved_api_key)
+        self.model_id = "gemini-2.0-flash"
+        logger.debug("GeminiClassifier initialised with model=%s", self.model_id)
 
     @staticmethod
     def _build_prompt() -> str:
-        labels = "\n".join(f'- "{label}"' for label in GeminiClassifier.CLASSIFICATION_LABELS)
+        descriptions = "\n".join([f'- {label.upper()}: {desc}' for label, desc in GeminiClassifier.LABEL_DESCRIPTIONS.items()])
         label_options = " | ".join(GeminiClassifier.CLASSIFICATION_LABELS)
         return (
-            "You are a health-insurance document page classification assistant.\n"
-            "Analyse exactly one document page and classify it into exactly one of these labels:\n"
-            f"{labels}\n\n"
-            "If the page is blank or visually empty, return \"empty\".\n"
-            "If the page contains mixed content, choose the dominant document type.\n"
-            "Respond with ONLY valid JSON and no markdown fences:\n"
+            "SYSTEM INSTRUCTION:\n"
+            "You are an expert document classifier for a health insurance company.\n"
+            "You will be provided with one or more images representing pages of a SINGLE document.\n"
+            "Analyze all pages and provide a single classification for the entire document.\n\n"
+            "CATEGORIES AND DESCRIPTIONS:\n"
+            f"{descriptions}\n\n"
+            "CRITICAL RULES:\n"
+            "1. Choose the single most accurate category for the WHOLE document.\n"
+            "2. If the document has mixed pages (e.g., a bill and an ID proof), choose the most 'important' one (usually the form or bill).\n"
+            "3. Respond ONLY with a valid JSON object.\n\n"
+            "RESPONSE FORMAT:\n"
             "{\n"
             f'  "category": "{label_options}",\n'
             '  "confidence": 0.0\n'
             "}\n"
-            "Confidence must be a decimal between 0.0 and 1.0."
         )
 
     @staticmethod
@@ -180,151 +209,164 @@ class GeminiClassifier:
         return category in cls.EXTRACTION_FIELDS_BY_CATEGORY
 
     def classify_document(
-        self, document_bytes: bytes, mime_type: str = "application/pdf"
+        self, pages: list[tuple[bytes, str]]
     ) -> tuple[str, float | None]:
+        """Classify a multi-page document as a single unit."""
         prompt = self._build_prompt()
-        doc_size_kb = len(document_bytes) / 1024
-        logger.info(
-            "Classifying document | mime_type=%s size=%.1f KB", mime_type, doc_size_kb
-        )
+        logger.info("Classifying document with %d pages", len(pages))
 
         try:
-            if mime_type == "text/plain":
-                text_content = document_bytes.decode("utf-8", errors="replace")
-                response = self.model.generate_content([prompt, text_content])
-            else:
-                encoded = base64.standard_b64encode(document_bytes).decode("utf-8")
-                response = self.model.generate_content(
-                    [
-                        {"inline_data": {"mime_type": mime_type, "data": encoded}},
-                        prompt,
-                    ]
+            parts = [prompt]
+            for page_bytes, page_mime in pages:
+                if page_mime == "text/plain":
+                    parts.append(page_bytes.decode("utf-8", errors="replace"))
+                else:
+                    parts.append(types.Part.from_bytes(data=page_bytes, mime_type=page_mime))
+
+            response = self.client.models.generate_content(
+                model=self.model_id,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "OBJECT",
+                        "properties": {
+                            "category": {"type": "STRING"},
+                            "confidence": {"type": "NUMBER"}
+                        },
+                        "required": ["category", "confidence"]
+                    }
                 )
+            )
         except Exception as exc:
-            logger.exception("Gemini classify call failed | mime_type=%s", mime_type)
+            logger.exception("Gemini multi-page classify call failed")
             raise RuntimeError(f"Gemini API error: {exc}") from exc
 
-        raw_text = (getattr(response, "text", "") or "").strip()
+        raw_text = response.text or ""
         category, confidence = self._parse_response(raw_text)
-        logger.info(
-            "Classification result | category=%r confidence=%s",
-            category,
-            f"{confidence:.2f}" if confidence is not None else "n/a",
-        )
+        logger.info("Document classification result | category=%r", category)
         return category, confidence
 
     @classmethod
     def _build_extraction_prompt(cls, document_category: str) -> str:
         field_names = cls.EXTRACTION_FIELDS_BY_CATEGORY[document_category]
-        json_lines = cls._build_extraction_json_lines(document_category, field_names)
         field_list = ", ".join(f'"{field_name}"' for field_name in field_names)
 
         return (
-            "You are a document data-extraction assistant.\n"
-            f'The document category is "{document_category}".\n'
-            f"Extract ONLY these fields: {field_list}.\n"
-            "If a field is not present, set its value to null.\n"
-            "Respond with ONLY valid JSON (no markdown fences, no extra text):\n"
-            "{\n"
-            f"{json_lines}\n"
-            "}\n\n"
-            "Rules:\n"
-            f'- Do not return any fields other than: {field_list}.\n'
-            "- Dates should be in DD-MM-YYYY format if possible.\n"
-            "- Keep names, IDs, addresses, and totals as written in the document when possible.\n"
-            "- If a field is missing or unreadable, return null for that field.\n"
-            "- For invoice/bill documents, include every line item you can find in billing_items.\n"
-            "- If an invoice/bill line item contains multiple nested sub-items, return only the main parent billing item and ignore the sub-items.\n"
-            "- Preserve status and diagnosis wording as written in the document when possible."
+            "SYSTEM INSTRUCTION:\n"
+            "You are a highly accurate data extraction specialist for medical and insurance documents.\n"
+            "You will be provided with multiple pages of a SINGLE document.\n"
+            "Your goal is to extract information across ALL pages and return ONE unified JSON object.\n\n"
+            f"DOCUMENT CATEGORY: {document_category.upper()}\n"
+            f"FIELDS TO EXTRACT: {field_list}\n\n"
+            "EXTRACTION RULES:\n"
+            "1. Consolidate data from all pages. If a field appears on multiple pages (like Policy Number), return it once.\n"
+            "2. If information for a field is spread across pages (e.g., a table), merge them into one complete list.\n"
+            "3. For each field, provide a 'value' and a 'confidence' score.\n"
+            "4. Format dates as DD-MM-YYYY.\n"
+            "5. If a field is missing, use null/0.0.\n"
+            "6. Respond ONLY with valid JSON.\n"
         )
 
-    @staticmethod
-    def _build_extraction_json_lines(
-        document_category: str, field_names: tuple[str, ...]
-    ) -> str:
-        json_lines: list[str] = []
-        for field_name in field_names:
-            if document_category == "invoice/bill" and field_name == "billing_items":
-                json_lines.extend(
-                    [
-                        '  "billing_items": [',
-                        '    {"billing_item": "...", "quantity": "...", "rate": "...", "subtotal": "..."}',
-                        "  ]",
-                    ]
-                )
-                continue
+    def _get_extraction_schema(self, document_category: str) -> dict[str, Any]:
+        field_names = self.EXTRACTION_FIELDS_BY_CATEGORY.get(document_category, [])
+        
+        # Helper for a single field with confidence
+        def field_with_confidence():
+            return {
+                "type": "OBJECT",
+                "properties": {
+                    "value": {"type": "STRING", "nullable": True},
+                    "confidence": {"type": "NUMBER"}
+                },
+                "required": ["value", "confidence"]
+            }
 
-            json_lines.append(f'  "{field_name}": "..."')
-
-        return ",\n".join(json_lines)
+        properties = {}
+        for field in field_names:
+            if field in ("billing_items", "line_items"):
+                item_properties = {
+                    "quantity": field_with_confidence(),
+                    "rate": field_with_confidence(),
+                    "subtotal": field_with_confidence(),
+                }
+                if field == "billing_items":
+                    item_properties["billing_item"] = field_with_confidence()
+                else:
+                    item_properties["description"] = field_with_confidence()
+                
+                properties[field] = {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": item_properties,
+                        "required": list(item_properties.keys())
+                    }
+                }
+            else:
+                properties[field] = field_with_confidence()
+        
+        return {
+            "type": "OBJECT",
+            "properties": properties,
+            "required": list(field_names)
+        }
 
     def extract_document(
         self,
-        document_bytes: bytes,
-        mime_type: str = "application/pdf",
+        pages: list[tuple[bytes, str]],
         document_category: str = "policy form",
     ) -> dict[str, Any]:
-        """Extract category-specific fields from a document using Gemini."""
+        """Extract data from a multi-page document into a single consolidated result."""
         prompt = self._build_extraction_prompt(document_category)
         allowed_fields = self.EXTRACTION_FIELDS_BY_CATEGORY[document_category]
-        doc_size_kb = len(document_bytes) / 1024
-        logger.info(
-            "Extracting data | category=%s mime_type=%s size=%.1f KB",
-            document_category,
-            mime_type,
-            doc_size_kb,
-        )
+        logger.info("Extracting data from %d pages | category=%s", len(pages), document_category)
 
         try:
-            if mime_type == "text/plain":
-                text_content = document_bytes.decode("utf-8", errors="replace")
-                response = self.model.generate_content([prompt, text_content])
-            else:
-                encoded = base64.standard_b64encode(document_bytes).decode("utf-8")
-                response = self.model.generate_content(
-                    [
-                        {"inline_data": {"mime_type": mime_type, "data": encoded}},
-                        prompt,
-                    ]
+            parts = [prompt]
+            for page_bytes, page_mime in pages:
+                if page_mime == "text/plain":
+                    parts.append(page_bytes.decode("utf-8", errors="replace"))
+                else:
+                    parts.append(types.Part.from_bytes(data=page_bytes, mime_type=page_mime))
+
+            response = self.client.models.generate_content(
+                model=self.model_id,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=self._get_extraction_schema(document_category)
                 )
+            )
         except Exception as exc:
-            logger.exception("Gemini extract call failed | mime_type=%s", mime_type)
+            logger.exception("Gemini multi-page extract call failed")
             raise RuntimeError(f"Gemini API error: {exc}") from exc
 
-        raw_text = (getattr(response, "text", "") or "").strip()
-        logger.debug("Raw extraction response: %r", raw_text)
-
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-            raw_text = re.sub(r"\s*```$", "", raw_text)
-
+        raw_text = response.text or "{}"
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError as exc:
             logger.error("Failed to parse Gemini JSON: %s | raw=%r", exc, raw_text)
             raise RuntimeError(f"Gemini returned invalid JSON: {exc}") from exc
 
-        result = {field_name: parsed.get(field_name) for field_name in allowed_fields}
-        if document_category == "invoice/bill":
-            raw_items = result.get("billing_items")
-            if isinstance(raw_items, list):
-                result["billing_items"] = [
-                    {
-                        "billing_item": item.get("billing_item"),
-                        "quantity": item.get("quantity"),
-                        "rate": item.get("rate"),
-                        "subtotal": item.get("subtotal"),
-                    }
-                    for item in raw_items
-                    if isinstance(item, dict)
-                ]
+        # Filtering logic
+        result = {}
+        for field_name in allowed_fields:
+            field_data = parsed.get(field_name)
+            if field_name in ("billing_items", "line_items"):
+                if isinstance(field_data, list):
+                    item_fields = ["quantity", "rate", "subtotal"]
+                    if field_name == "billing_items":
+                        item_fields.append("billing_item")
+                    else:
+                        item_fields.append("description")
+                    result[field_name] = [
+                        {k: item.get(k) for k in item_fields}
+                        for item in field_data if isinstance(item, dict)
+                    ]
+                else:
+                    result[field_name] = None
             else:
-                result["billing_items"] = None
+                result[field_name] = field_data
 
-        logger.info(
-            "Extraction complete | category=%s fields_found=%d/%d",
-            document_category,
-            sum(1 for value in result.values() if value is not None),
-            len(allowed_fields),
-        )
         return result

@@ -2,21 +2,21 @@ import asyncio
 import logging
 
 import fitz
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Request
 
 from models.classification import (
     BatchClassificationResponse,
     BatchExtractionResponse,
     FileClassificationResult,
     FileExtractionResult,
-    PageExtractionResult,
-    PageClassificationResult,
 )
 from services.gemini_classifier import GeminiClassifier
+from core.security import get_api_key
+from core.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_api_key)])
 
 ALLOWED_MIME_TYPES = {
     "application/pdf": "application/pdf",
@@ -92,7 +92,7 @@ def _render_pdf_pages(document_bytes: bytes) -> list[tuple[int, bytes, str, bool
     page_images: list[tuple[int, bytes, str, bool]] = []
     for page_number in range(document.page_count):
         page = document.load_page(page_number)
-        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
         page_has_content = bool(page.get_text("text").strip()) or bool(page.get_drawings())
         is_empty = not page_has_content and _is_visually_empty_pixmap(pixmap)
         page_images.append((page_number + 1, pixmap.tobytes("png"), "image/png", is_empty))
@@ -109,13 +109,15 @@ def _render_pdf_pages(document_bytes: bytes) -> list[tuple[int, bytes, str, bool
     response_model=BatchClassificationResponse,
     summary="Classify one or more documents",
 )
+@limiter.limit("5/minute")
 async def classify_bill_document(
+    request: Request,
     files: list[UploadFile] = File(...),
     classifier: GeminiClassifier = Depends(get_classifier),
 ):
     """
     Upload one or more documents (PDF, image, or plain text).
-    Returns page-wise classification results for each file.
+    Returns a single classification for each file (multi-page analysis).
     """
 
     async def _classify_one(file: UploadFile) -> FileClassificationResult:
@@ -123,97 +125,24 @@ async def classify_bill_document(
         content_type = file.content_type or "application/octet-stream"
         mime_type = ALLOWED_MIME_TYPES.get(content_type)
         if mime_type is None:
-            logger.warning(
-                "Unsupported file type | filename=%s mime=%s", filename, content_type
-            )
-            return FileClassificationResult(
-                filename=filename,
-                error=f"Unsupported file type: {content_type}",
-            )
+            return FileClassificationResult(filename=filename, category="other", error=f"Unsupported file type: {content_type}")
 
         try:
             content = await file.read()
-        except Exception as exc:
-            logger.exception("Failed to read file | filename=%s", filename)
-            return FileClassificationResult(
-                filename=filename,
-                error=f"Read error: {exc}",
-            )
-
-        logger.info(
-            "File received | filename=%s size=%d bytes mime_type=%s",
-            filename,
-            len(content),
-            mime_type,
-        )
-
-        try:
             if mime_type == "application/pdf":
-                page_inputs = _render_pdf_pages(content)
+                page_data = _render_pdf_pages(content)
+                pages = [(pb, pm) for _, pb, pm, empty in page_data if not empty]
             else:
-                if mime_type == "text/plain":
-                    is_empty = _is_empty_text_page(content)
-                else:
-                    is_empty = _is_empty_image_page(content, mime_type)
-                page_inputs = [(1, content, mime_type, is_empty)]
-        except RuntimeError as exc:
-            logger.error("Failed to prepare file for classification | filename=%s", filename)
-            return FileClassificationResult(filename=filename, error=str(exc))
+                pages = [(content, mime_type)]
+            
+            if not pages:
+                return FileClassificationResult(filename=filename, category="empty", confidence=1.0)
 
-        tasks = [
-            asyncio.to_thread(classifier.classify_document, page_bytes, page_mime)
-            for _, page_bytes, page_mime, is_empty in page_inputs
-            if not is_empty
-        ]
-        raw_results = iter(await asyncio.gather(*tasks, return_exceptions=True))
-
-        pages: list[PageClassificationResult] = []
-        for page_number, _, _, is_empty in page_inputs:
-            if is_empty:
-                pages.append(
-                    PageClassificationResult(
-                        page_number=page_number,
-                        category="empty",
-                        confidence=1.0,
-                    )
-                )
-                continue
-
-            raw_result = next(raw_results)
-            if isinstance(raw_result, Exception):
-                logger.error(
-                    "Gemini error | filename=%s page=%d error=%s",
-                    filename,
-                    page_number,
-                    raw_result,
-                )
-                pages.append(
-                    PageClassificationResult(
-                        page_number=page_number,
-                        category="other",
-                        confidence=None,
-                        error=f"Gemini error: {raw_result}",
-                    )
-                )
-                continue
-
-            category, confidence = raw_result
-            logger.info(
-                "Classified | filename=%s page=%d category=%r confidence=%s",
-                filename,
-                page_number,
-                category,
-                f"{confidence:.2f}" if confidence is not None else "n/a",
-            )
-            pages.append(
-                PageClassificationResult(
-                    page_number=page_number,
-                    category=category,
-                    confidence=confidence,
-                )
-            )
-
-        return FileClassificationResult(filename=filename, pages=pages)
+            category, confidence = await asyncio.to_thread(classifier.classify_document, pages)
+            return FileClassificationResult(filename=filename, category=category, confidence=confidence)
+        except Exception as exc:
+            logger.exception("Classification failed for %s", filename)
+            return FileClassificationResult(filename=filename, category="other", error=str(exc))
 
     results = await asyncio.gather(*[_classify_one(file) for file in files])
     return BatchClassificationResponse(results=list(results))
@@ -224,167 +153,52 @@ async def classify_bill_document(
     response_model=BatchExtractionResponse,
     summary="Extract structured data from one or more documents",
 )
+@limiter.limit("5/minute")
 async def extract_document_data(
+    request: Request,
     files: list[UploadFile] = File(...),
     classifier: GeminiClassifier = Depends(get_classifier),
 ):
     """
-    Upload one or more documents (PDF, image, or plain text).
-    Detects the document category page by page and returns category-specific
-    extraction results for each page.
+    Upload one or more documents. Performs multi-page classification 
+    followed by consolidated extraction.
     """
     async def _extract_one(file: UploadFile) -> FileExtractionResult:
         filename = file.filename or "unknown"
         content_type = file.content_type or "application/octet-stream"
         mime_type = ALLOWED_MIME_TYPES.get(content_type)
         if mime_type is None:
-            logger.warning(
-                "Unsupported file type | filename=%s mime=%s", filename, content_type
-            )
-            return FileExtractionResult(
-                filename=filename,
-                error=f"Unsupported file type: {content_type}",
-            )
+            return FileExtractionResult(filename=filename, document_category="other", error=f"Unsupported file type")
 
         try:
             content = await file.read()
-        except Exception:
-            logger.exception("Failed to read file | filename=%s", filename)
-            return FileExtractionResult(
-                filename=filename,
-                error="Read error",
-            )
-
-        logger.info(
-            "File received for extraction | filename=%s size=%d bytes mime_type=%s",
-            filename,
-            len(content),
-            mime_type,
-        )
-
-        try:
             if mime_type == "application/pdf":
-                page_inputs = _render_pdf_pages(content)
+                page_data = _render_pdf_pages(content)
+                pages = [(pb, pm) for _, pb, pm, empty in page_data if not empty]
             else:
-                if mime_type == "text/plain":
-                    is_empty = _is_empty_text_page(content)
-                else:
-                    is_empty = _is_empty_image_page(content, mime_type)
-                page_inputs = [(1, content, mime_type, is_empty)]
-        except RuntimeError as exc:
-            logger.error("Failed to prepare file for extraction | filename=%s", filename)
-            return FileExtractionResult(filename=filename, error=str(exc))
+                pages = [(content, mime_type)]
 
-        classification_tasks = [
-            asyncio.to_thread(classifier.classify_document, page_bytes, page_mime)
-            for _, page_bytes, page_mime, is_empty in page_inputs
-            if not is_empty
-        ]
-        classified_results = iter(
-            await asyncio.gather(*classification_tasks, return_exceptions=True)
-        )
+            if not pages:
+                return FileExtractionResult(filename=filename, document_category="empty", error="Empty file")
 
-        page_results: list[PageExtractionResult] = []
-        extractable_pages: list[tuple[int, bytes, str, str, float | None]] = []
-
-        for page_number, page_bytes, page_mime, is_empty in page_inputs:
-            if is_empty:
-                page_results.append(
-                    PageExtractionResult(
-                        page_number=page_number,
-                        document_category="empty",
-                        confidence=1.0,
-                        error="No data to extract",
-                    )
-                )
-                continue
-
-            raw_classification = next(classified_results)
-            if isinstance(raw_classification, Exception):
-                logger.error(
-                    "Gemini classify error during extraction | filename=%s page=%d error=%s",
-                    filename,
-                    page_number,
-                    raw_classification,
-                )
-                page_results.append(
-                    PageExtractionResult(
-                        page_number=page_number,
-                        document_category="other",
-                        error=f"Gemini classify error: {raw_classification}",
-                    )
-                )
-                continue
-
-            document_category, confidence = raw_classification
-            if not classifier.supports_extraction_category(document_category):
-                page_results.append(
-                    PageExtractionResult(
-                        page_number=page_number,
-                        document_category=document_category,
-                        confidence=confidence,
-                        error=(
-                            f"No extraction schema configured for category: {document_category}"
-                        ),
-                    )
-                )
-                continue
-
-            extractable_pages.append(
-                (page_number, page_bytes, page_mime, document_category, confidence)
-            )
-
-        extraction_tasks = [
-            asyncio.to_thread(
-                classifier.extract_document,
-                page_bytes,
-                page_mime,
-                document_category,
-            )
-            for _, page_bytes, page_mime, document_category, _ in extractable_pages
-        ]
-        extraction_outputs = iter(
-            await asyncio.gather(*extraction_tasks, return_exceptions=True)
-        )
-
-        for (
-            page_number,
-            _page_bytes,
-            _page_mime,
-            document_category,
-            confidence,
-        ) in extractable_pages:
-            extraction_output = next(extraction_outputs)
-            if isinstance(extraction_output, Exception):
-                logger.error(
-                    "Gemini extract error | filename=%s page=%d category=%s error=%s",
-                    filename,
-                    page_number,
-                    document_category,
-                    extraction_output,
-                )
-                page_results.append(
-                    PageExtractionResult(
-                        page_number=page_number,
-                        document_category=document_category,
-                        confidence=confidence,
-                        error=f"Gemini extract error: {extraction_output}",
-                    )
-                )
-                continue
-
-            page_results.append(
-                PageExtractionResult(
-                    page_number=page_number,
-                    document_category=document_category,
+            # 1. Classify the whole document
+            category, confidence = await asyncio.to_thread(classifier.classify_document, pages)
+            
+            if not classifier.supports_extraction_category(category):
+                return FileExtractionResult(
+                    filename=filename, 
+                    document_category=category, 
                     confidence=confidence,
-                    data=extraction_output,
+                    error=f"No extraction schema for category: {category}"
                 )
-            )
 
-        page_results.sort(key=lambda page: page.page_number)
-        logger.info("Extraction done | filename=%s pages=%d", filename, len(page_results))
-        return FileExtractionResult(filename=filename, pages=page_results)
+            # 2. Extract from the whole document
+            data = await asyncio.to_thread(classifier.extract_document, pages, category)
+            return FileExtractionResult(filename=filename, document_category=category, confidence=confidence, data=data)
+            
+        except Exception as exc:
+            logger.exception("Extraction failed for %s", filename)
+            return FileExtractionResult(filename=filename, document_category="other", error=str(exc))
 
     results = await asyncio.gather(*[_extract_one(file) for file in files])
     return BatchExtractionResponse(results=list(results))
